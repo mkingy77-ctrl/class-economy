@@ -479,6 +479,20 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const fbAuth = firebase.auth();
 const fbDb = firebase.database();
+// Secondary app instance — used by CEO to create users without disturbing their own session
+const secondaryApp = firebase.initializeApp(firebaseConfig, 'secondary');
+const secondaryAuth = secondaryApp.auth();
+
+// Dynamic loan rates — live-synced from /config/loanRates (CEO editable)
+let loanRates = {small:0, medium:5, large:17};
+fbDb.ref('/config/loanRates').on('value', snap => {
+  const v = snap.val();
+  if (v && typeof v === 'object') {
+    if (typeof v.small  === 'number') loanRates.small  = v.small;
+    if (typeof v.medium === 'number') loanRates.medium = v.medium;
+    if (typeof v.large  === 'number') loanRates.large  = v.large;
+  }
+});
 
 let users={}, currentUser=null, state=null, pendingPlan=null, pendingLoanAmt=null, selectedStars=0;
 let treasury={balance:0,transactions:{}};
@@ -616,6 +630,7 @@ function fmtMoney(n){return '$'+Math.abs(+n||0).toFixed(2).replace(/\B(?=(\d{3})
 function nowStr(){return new Date().toLocaleString('en-AU',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}
 function addTx(u,type,icon,label,amount){if(!u.transactions)u.transactions=[];u.transactions.unshift({type,icon,label,date:nowStr(),amount});}
 function getRegularUsers(){const seen=new Set();return Object.values(users).filter(u=>{if(u.role!=='user')return false;if(seen.has(u.username))return false;seen.add(u.username);return true;});}
+function getManageableAccounts(){const seen=new Set();return Object.values(users).filter(u=>{if(u.role!=='user'&&u.role!=='employee')return false;if(STAFF_ACCOUNTS[u.email])return false;if(seen.has(u.username))return false;seen.add(u.username);return true;});}
 function planPill(p){return `<span class="plan-pill ${PLANS[p]?.pill||'pill-free'}">${PLANS[p]?.label||'Free'}</span>`;}
 function txHTML(t,delay=0){const pos=t.amount>=0;return `<div class="tx-item" style="animation-delay:${delay}s"><div class="tx-icon ${t.type}">${t.icon}</div><div class="tx-desc"><strong>${t.label}</strong><small>${t.date}</small></div><div class="tx-amount ${pos?'pos':'neg'}">${pos?'+':'-'}${fmtMoney(t.amount)}</div></div>`;}
 
@@ -636,7 +651,7 @@ function buildAccount(){
   const txs=(state.transactions||[]).map((t,i)=>txHTML(t,i*.03)).join('')||'<div class="tx-empty">No transactions yet.</div>';
   return `<div class="page-header"><h1>Account Info</h1><p>Manage your profile, funds &amp; history</p></div>
   <div class="panel"><h2>Personal Information</h2><div class="form-grid"><div class="field form-full"><label>Full Name</label><input type="text" id="acc-name" value="${state.name||''}" placeholder="Full name"></div><div class="field"><label>Email (read-only)</label><input type="email" value="${state.email||''}" readonly></div><div class="field"><label>Phone</label><input type="tel" id="acc-phone" value="${state.phone||''}" placeholder="(555) 000-0000"></div><div class="field"><label>Date of Birth</label><input type="date" id="acc-dob" value="${state.dob||''}"></div><div class="field"><label>Username (read-only)</label><input type="text" value="${state.username||currentUser}" readonly></div></div><div class="btn-row"><button class="btn btn-primary" onclick="saveAccount()">Save Changes</button></div></div>
-  <div class="panel"><h2>Deposit &amp; Withdraw</h2><div class="dw-grid"><div class="dw-box dep"><h3>💰 Deposit</h3><div class="dw-input-row"><div class="field"><label>Amount ($)</label><input type="number" id="dep-amt" placeholder="0.00" min="0.01" step="0.01"></div><button class="btn btn-green" onclick="doDeposit()">Add</button></div></div><div class="dw-box wit"><h3>💸 Withdraw</h3><div class="dw-input-row"><div class="field"><label>Amount ($)</label><input type="number" id="wit-amt" placeholder="0.00" min="0.01" step="0.01"></div><button class="btn btn-primary" onclick="doWithdraw()">Take</button></div></div></div><div style="margin-top:.9rem;text-align:center"><span style="font-family:'Oswald',sans-serif;font-size:.8rem;letter-spacing:1px;color:var(--dim)">Current Balance: </span><span style="font-family:'Oswald',sans-serif;font-size:1.1rem;color:var(--red-bright);font-weight:700">${fmtMoney(state.balance)}</span></div></div>
+  <div class="panel"><h2>Withdraw Funds</h2><div class="dw-box wit"><h3>💸 Withdraw</h3><div class="dw-input-row"><div class="field"><label>Amount ($)</label><input type="number" id="wit-amt" placeholder="0.00" min="0.01" step="0.01"></div><button class="btn btn-primary" onclick="doWithdraw()">Take</button></div></div><div style="margin-top:.9rem;text-align:center"><span style="font-family:'Oswald',sans-serif;font-size:.8rem;letter-spacing:1px;color:var(--dim)">Current Balance: </span><span style="font-family:'Oswald',sans-serif;font-size:1.1rem;color:var(--red-bright);font-weight:700">${fmtMoney(state.balance)}</span></div><p style="font-size:.82rem;color:var(--dim);text-align:center;margin-top:.6rem">💡 Need more funds? Apply for a loan, request a daily bonus from staff, or wait for a government grant.</p></div>
   <div class="panel"><h2>Transaction History</h2><div style="display:flex;justify-content:flex-end;margin-bottom:.85rem"><button class="btn btn-outline btn-sm" onclick="clearHistory()">Clear History</button></div><div class="tx-list">${txs}</div></div>`;
 }
 
@@ -646,12 +661,6 @@ function saveAccount(){
   state.phone=document.getElementById('acc-phone')?.value.trim()||state.phone;
   state.dob=document.getElementById('acc-dob')?.value||state.dob;
   showToast('Account saved!',true);saveUser(currentUser);buildNav();
-}
-function doDeposit(){
-  const amt=parseFloat(document.getElementById('dep-amt')?.value);
-  if(!amt||amt<=0){showToast('Enter a valid amount.');return;}
-  state.balance=+(state.balance+amt).toFixed(2);addTx(state,'income','📥','Deposit',amt);
-  showToast('Deposited '+fmtMoney(amt)+'!',true);saveUser(currentUser);showTab('account');
 }
 function doWithdraw(){
   const amt=parseFloat(document.getElementById('wit-amt')?.value);
@@ -699,15 +708,19 @@ function confirmPlan(){
 
 // ══ USER LOAN ══
 function buildLoan(){
+  const ex2=(10*(1+loanRates.medium/100)).toFixed(2);
+  const ex3=(20*(1+loanRates.large/100)).toFixed(2);
   return `<div class="page-header"><h1>Loan Calculator</h1><p>See your exact repayment amount</p></div>
-  <div class="loan-wrap"><div class="panel"><h2>Interest Rate Table</h2><table class="rate-table"><thead><tr><th>Loan Amount</th><th>Interest</th><th>Example</th></tr></thead><tbody><tr><td>Under $5.00</td><td><span class="rate-hl">0%</span></td><td>$4 → repay $4.00</td></tr><tr><td>$5.00 – $15.00</td><td><span class="rate-hl">5%</span></td><td>$10 → repay $10.50</td></tr><tr><td>Over $15.00</td><td><span class="rate-hl">17%</span></td><td>$20 → repay $23.40</td></tr></tbody></table></div>
+  <div class="loan-wrap"><div class="panel"><h2>Interest Rate Table</h2><table class="rate-table"><thead><tr><th>Loan Amount</th><th>Interest</th><th>Example</th></tr></thead><tbody><tr><td>Under $5.00</td><td><span class="rate-hl">${loanRates.small}%</span></td><td>$4 → repay $${(4*(1+loanRates.small/100)).toFixed(2)}</td></tr><tr><td>$5.00 – $15.00</td><td><span class="rate-hl">${loanRates.medium}%</span></td><td>$10 → repay $${ex2}</td></tr><tr><td>Over $15.00</td><td><span class="rate-hl">${loanRates.large}%</span></td><td>$20 → repay $${ex3}</td></tr></tbody></table></div>
   <div class="panel"><h2>Calculate &amp; Apply</h2><div class="field"><label>Loan Amount ($)</label><input type="number" id="loan-amt" placeholder="e.g. 12.00" min="0.01" step="0.01" oninput="calcLoan()"></div><div class="loan-result" id="loan-result" style="display:none"><div class="loan-result-label">Total Repayment</div><div class="loan-result-value" id="loan-total">$0.00</div><div class="loan-breakdown"><div><div class="lbl">Principal</div><div class="val" id="loan-principal"></div></div><div><div class="lbl">Interest</div><div class="val" id="loan-interest"></div></div><div><div class="lbl">Rate</div><div class="val" id="loan-rate"></div></div></div></div><div class="btn-row"><button class="btn btn-primary" onclick="requestLoan()">Request Loan</button></div><div style="margin-top:.7rem;font-size:.82rem;color:var(--dim);text-align:center">Loan requests are reviewed and approved by staff.</div></div></div>`;
 }
 function calcLoan(){
   const amt=parseFloat(document.getElementById('loan-amt')?.value);
   const res=document.getElementById('loan-result');
   if(!amt||amt<=0){if(res)res.style.display='none';return;}
-  let rate=0;if(amt>=5&&amt<=15)rate=.05;else if(amt>15)rate=.17;
+  let rate=loanRates.small/100;
+  if(amt>=5&&amt<=15)rate=loanRates.medium/100;
+  else if(amt>15)rate=loanRates.large/100;
   const interest=amt*rate,total=amt+interest;
   document.getElementById('loan-principal').textContent=fmtMoney(amt);
   document.getElementById('loan-interest').textContent=fmtMoney(interest);
@@ -718,7 +731,9 @@ function calcLoan(){
 function requestLoan(){
   const amt=parseFloat(document.getElementById('loan-amt')?.value);
   if(!amt||amt<=0){showToast('Enter a loan amount first.');return;}
-  let rate=0;if(amt>=5&&amt<=15)rate=.05;else if(amt>15)rate=.17;
+  let rate=loanRates.small/100;
+  if(amt>=5&&amt<=15)rate=loanRates.medium/100;
+  else if(amt>15)rate=loanRates.large/100;
   const repay=+(amt+amt*rate).toFixed(2);
   if(!state.loanRequests)state.loanRequests=[];
   state.loanRequests.push({id:Date.now(),amount:amt,repay,rate:(rate*100)+'%',status:'pending',date:nowStr(),user:state.name,username:state.username});
@@ -776,7 +791,49 @@ function buildAdminLoans(role){
   const isCeo=role==='ceo';const titleClass=isCeo?'ceo-title':'emp-title';
   const pendingHTML=pending.length?pending.map(l=>`<div class="loan-req-card"><div class="loan-req-info"><strong>${l.userName}</strong><span>${l.date} · Rate: ${l.rate} · Repay: ${fmtMoney(l.repay)}</span></div><div class="loan-req-amt">${fmtMoney(l.amount)}</div><div class="loan-req-actions"><button class="btn btn-green btn-sm" onclick="approveLoan('${l.ownerUid}',${l.id})">Approve</button><button class="btn btn-primary btn-sm" onclick="denyLoan('${l.ownerUid}',${l.id})">Deny</button>${isCeo?`<button class="btn btn-blue btn-sm" onclick="editLoanRate('${l.ownerUid}',${l.id})">Edit Rate</button>`:''}</div></div>`).join(''):'<div class="tx-empty">No pending loans.</div>';
   const doneHTML=done.length?done.map(l=>`<div class="loan-req-card"><div class="loan-req-info"><strong>${l.userName}</strong><span>${l.date} · Rate: ${l.rate} · Repay: ${fmtMoney(l.repay)}</span></div><div class="loan-req-amt">${fmtMoney(l.amount)}</div><span class="status-pill status-${l.status==='repaid'?'approved':l.status}">${l.status}</span>${l.status==='approved'?`<button class="btn btn-green btn-sm" onclick="markLoanRepaid('${l.ownerUid}',${l.id})">Mark Repaid</button>`:''}</div>`).join(''):'<div class="tx-empty">No processed loans.</div>';
-  return `<div class="page-header ${isCeo?'ceo-header':'emp-header'}"><h1>Loan Management</h1><p>Approve, deny or edit loan requests</p></div><div class="panel"><h2 class="${titleClass}">Pending Requests (${pending.length})</h2>${pendingHTML}</div><div class="panel"><h2 class="${titleClass}">Processed Loans</h2>${doneHTML}</div>`;
+  let ceoExtras='';
+  if(isCeo){
+    const userOptions=regs.map(u=>`<option value="${u.uid}">${u.name} (bal: ${fmtMoney(u.balance)})</option>`).join('');
+    ceoExtras=`<div class="panel"><h2 class="ceo-title">💸 Issue Loan to User</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Grant a loan directly. The user's balance jumps up immediately and they owe the repay amount.</p><div class="form-grid"><div class="field form-full"><label>Recipient</label><select id="iss-target"><option value="">Pick a user...</option>${userOptions}</select></div><div class="field"><label>Amount ($)</label><input type="number" id="iss-amt" placeholder="e.g. 25.00" min="0.01" step="0.01"></div><div class="field"><label>Custom Rate % (optional)</label><input type="number" id="iss-rate" placeholder="leave blank for standard tier" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoIssueLoan()">Issue Loan</button></div></div><div class="panel"><h2 class="ceo-title">📊 Interest Rates</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Set the interest rate (%) for each loan tier. Updates apply to all new loans across the system instantly.</p><div class="form-grid"><div class="field"><label>Under $5 (%)</label><input type="number" id="rate-small" value="${loanRates.small}" min="0" step="0.1"></div><div class="field"><label>$5 – $15 (%)</label><input type="number" id="rate-medium" value="${loanRates.medium}" min="0" step="0.1"></div><div class="field"><label>Over $15 (%)</label><input type="number" id="rate-large" value="${loanRates.large}" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoSaveRates()">Save Rates</button></div></div>`;
+  }
+  return `<div class="page-header ${isCeo?'ceo-header':'emp-header'}"><h1>Loan Management</h1><p>Approve, deny or issue loans</p></div>${ceoExtras}<div class="panel"><h2 class="${titleClass}">Pending Requests (${pending.length})</h2>${pendingHTML}</div><div class="panel"><h2 class="${titleClass}">Processed Loans</h2>${doneHTML}</div>`;
+}
+
+async function ceoIssueLoan(){
+  const uid=document.getElementById('iss-target').value;
+  const amt=parseFloat(document.getElementById('iss-amt').value);
+  const customRateRaw=document.getElementById('iss-rate').value.trim();
+  if(!uid){showToast('Pick a recipient.');return;}
+  if(!amt||amt<=0){showToast('Enter a valid amount.');return;}
+  const u=users[uid];if(!u){showToast('User not found.');return;}
+  let rate;
+  if(customRateRaw!==''){
+    rate=parseFloat(customRateRaw)/100;
+    if(isNaN(rate)||rate<0){showToast('Invalid rate.');return;}
+  }else{
+    rate=loanRates.small/100;
+    if(amt>=5&&amt<=15)rate=loanRates.medium/100;
+    else if(amt>15)rate=loanRates.large/100;
+  }
+  const repay=+(amt+amt*rate).toFixed(2);
+  if(!confirm(`Issue ${fmtMoney(amt)} to ${u.name}? They will owe ${fmtMoney(repay)} (rate: ${(rate*100).toFixed(2)}%).`))return;
+  if(!u.loanRequests)u.loanRequests=[];
+  u.loanRequests.push({id:Date.now(),amount:amt,repay,rate:(rate*100).toFixed(2)+'%',status:'approved',date:nowStr(),user:u.name,username:u.username});
+  u.balance=+(u.balance+amt).toFixed(2);
+  addTx(u,'loan','🏦','Loan from CEO: '+fmtMoney(amt)+' (repay '+fmtMoney(repay)+')',amt);
+  await saveUser(uid);
+  showToast('Loan of '+fmtMoney(amt)+' issued to '+u.name,true);showTab('ceo-loans');
+}
+
+async function ceoSaveRates(){
+  const small=parseFloat(document.getElementById('rate-small').value);
+  const medium=parseFloat(document.getElementById('rate-medium').value);
+  const large=parseFloat(document.getElementById('rate-large').value);
+  if([small,medium,large].some(v=>isNaN(v)||v<0)){showToast('Enter valid rates (0 or higher).');return;}
+  try{
+    await fbDb.ref('/config/loanRates').set({small,medium,large});
+    showToast('Loan rates updated!',true);
+  }catch(e){showToast('Save failed: '+(e.message||''));}
 }
 
 function buildLoanReqList(){
@@ -852,18 +909,90 @@ function buildCeoOverview(){
 }
 
 function buildCeoUsers(){
-  const all=getRegularUsers();
-  const rows=all.map(u=>`<tr><td>${u.name}</td><td style="color:var(--dim)">${u.username}</td><td style="color:var(--dim);font-size:.8rem">${u.email}</td><td><input type="number" value="${u.balance.toFixed(2)}" id="cbal-${u.uid}" step="0.01"></td><td><select id="csub-${u.uid}" style="min-width:80px">${Object.entries(PLANS).map(([k,p])=>`<option value="${k}" ${u.subscription===k?'selected':''}>${p.label}</option>`).join('')}</select></td><td><button class="btn btn-blue btn-sm" onclick="ceoUpdateUser('${u.uid}')">Save</button> <button class="btn btn-outline btn-sm" onclick="empViewTx('${u.uid}')">Txs</button></td></tr>`).join('');
-  return `<div class="page-header ceo-header"><h1>All Users</h1><p>Full control over every account</p></div><div class="panel"><h2 class="ceo-title">User Registry</h2><input class="admin-search" placeholder="Search users..." oninput="filterUserTable(this.value)"><div class="user-table-wrap"><table class="user-table" id="user-table"><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Balance ($)</th><th>Plan</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:1.5rem">No users yet.</td></tr>'}</tbody></table></div></div><div class="panel" id="tx-view-panel" style="display:none"><h2 class="ceo-title" id="tx-view-title">Transactions</h2><div class="tx-list" id="tx-view-list"></div></div>`;
+  const all=getManageableAccounts();
+  const rows=all.map(u=>`<tr><td><input type="text" value="${u.name}" id="cname-${u.uid}" style="width:120px"></td><td style="color:var(--dim)">${u.username}</td><td style="color:var(--dim);font-size:.8rem">${u.email}</td><td><input type="number" value="${(u.balance||0).toFixed(2)}" id="cbal-${u.uid}" step="0.01"></td><td><select id="csub-${u.uid}" style="min-width:80px">${Object.entries(PLANS).map(([k,p])=>`<option value="${k}" ${u.subscription===k?'selected':''}>${p.label}</option>`).join('')}</select></td><td><select id="crole-${u.uid}" style="min-width:90px"><option value="user" ${u.role==='user'?'selected':''}>User</option><option value="employee" ${u.role==='employee'?'selected':''}>Employee</option></select></td><td><button class="btn btn-blue btn-sm" onclick="ceoUpdateUser('${u.uid}')">Save</button> <button class="btn btn-outline btn-sm" onclick="empViewTx('${u.uid}')">Txs</button> <button class="btn btn-primary btn-sm" onclick="ceoDeleteUser('${u.uid}')">Delete</button></td></tr>`).join('');
+  const userCount=all.filter(u=>u.role==='user').length;
+  const empCount=all.filter(u=>u.role==='employee').length;
+  return `<div class="page-header ceo-header"><h1>All Accounts</h1><p>Add, edit, promote or remove accounts (${userCount} user${userCount===1?'':'s'} · ${empCount} promoted employee${empCount===1?'':'s'})</p></div>
+  <div class="panel"><h2 class="ceo-title">➕ Add New User</h2>
+    <p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Create a regular user account. They'll be able to sign in with the email + password you set.</p>
+    <div class="form-grid">
+      <div class="field"><label>Full Name</label><input type="text" id="add-name" placeholder="e.g. Sam Smith"></div>
+      <div class="field"><label>Email</label><input type="email" id="add-email" placeholder="sam@example.com"></div>
+      <div class="field"><label>Username</label><input type="text" id="add-user" placeholder="3-20 letters/digits/_"></div>
+      <div class="field"><label>Initial Password (min 6)</label><input type="text" id="add-pass" placeholder="they can change later"></div>
+    </div>
+    <div class="auth-error" id="add-error"></div>
+    <div class="btn-row"><button class="btn btn-gold" onclick="ceoAddUser()">Add User</button></div>
+  </div>
+  <div class="panel"><h2 class="ceo-title">Account Registry (${all.length})</h2><input class="admin-search" placeholder="Search accounts..." oninput="filterUserTable(this.value)"><div class="user-table-wrap"><table class="user-table" id="user-table"><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Balance ($)</th><th>Plan</th><th>Role</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--dim);text-align:center;padding:1.5rem">No accounts yet — add one above.</td></tr>'}</tbody></table></div></div>
+  <div class="panel" id="tx-view-panel" style="display:none"><h2 class="ceo-title" id="tx-view-title">Transactions</h2><div class="tx-list" id="tx-view-list"></div></div>`;
 }
 
 function ceoUpdateUser(uid){
   const u=users[uid];if(!u)return;
+  if(STAFF_ACCOUNTS[u.email]){showToast('Cannot edit hardcoded staff accounts here.','warn');return;}
+  const newName=document.getElementById('cname-'+uid)?.value.trim();
   const newBal=parseFloat(document.getElementById('cbal-'+uid)?.value);
   const newSub=document.getElementById('csub-'+uid)?.value;
+  const newRole=document.getElementById('crole-'+uid)?.value;
+  if(newRole&&newRole!==u.role){
+    if(newRole!=='user'&&newRole!=='employee'){showToast('Invalid role.');return;}
+    const verb=newRole==='employee'?'PROMOTE to Employee':'DEMOTE to regular User';
+    if(!confirm(`${verb} ${u.name}? They will see ${newRole==='employee'?'staff dashboards and gain admin powers':'only their own user dashboard'} the next time they sign in.`))return;
+    u.role=newRole;
+  }
+  if(newName&&newName!==u.name)u.name=newName;
   if(!isNaN(newBal)&&newBal>=0){const diff=+(newBal-u.balance).toFixed(2);u.balance=+newBal.toFixed(2);if(diff!==0)addTx(u,diff>0?'income':'expense','👑','CEO Balance Adjustment',diff);}
   if(newSub&&newSub!==u.subscription)u.subscription=newSub;
   saveUser(uid);showToast(u.name+' updated!',true);
+  // re-render so the row reflects new role / disappears if filtered
+  showTab('ceo-users');
+}
+
+async function ceoAddUser(){
+  const name=document.getElementById('add-name').value.trim();
+  const email=document.getElementById('add-email').value.trim().toLowerCase();
+  const username=document.getElementById('add-user').value.trim().toLowerCase();
+  const password=document.getElementById('add-pass').value;
+  const errEl=document.getElementById('add-error');errEl.textContent='';
+  if(!name||!email||!username||!password){errEl.textContent='Fill in all fields.';return;}
+  if(password.length<6){errEl.textContent='Password needs 6+ characters.';return;}
+  if(!/^[a-z0-9_]{3,20}$/.test(username)){errEl.textContent='Username: 3-20 letters, numbers or _.';return;}
+  if(RESERVED_USERNAMES.has(username)){errEl.textContent='Username not available.';return;}
+  if(STAFF_ACCOUNTS[email]){errEl.textContent='That email is a staff account.';return;}
+  try{
+    const existing=await fbDb.ref('/usernames/'+username).once('value');
+    if(existing.val()){errEl.textContent='Username already taken.';return;}
+    const cred=await secondaryAuth.createUserWithEmailAndPassword(email,password);
+    const uid=cred.user.uid;
+    const joinDate=new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+    const cardNum='•••• •••• •••• '+Math.floor(1000+Math.random()*9000);
+    const profile={role:'user',name,email,username,balance:10,subscription:'free',cardType:'free',cardNum,transactions:[{type:'income',icon:'🎉',label:'Welcome Bonus (added by CEO)',date:'Just now',amount:10}],joinDate,joinTimestamp:Date.now(),phone:'',dob:'',reviewDone:false,loanRequests:[]};
+    await fbDb.ref('/users/'+uid).set(profile);
+    await fbDb.ref('/usernames/'+username).set({uid,email});
+    profile.uid=uid;users[uid]=profile;
+    try{await secondaryAuth.signOut();}catch(_){}
+    showToast(name+' added!',true);showTab('ceo-users');
+  }catch(e){
+    try{await secondaryAuth.signOut();}catch(_){}
+    if(e.code==='auth/email-already-in-use')errEl.textContent='Email already registered.';
+    else if(e.code==='auth/weak-password')errEl.textContent='Password too weak.';
+    else if(e.code==='auth/invalid-email')errEl.textContent='Invalid email.';
+    else errEl.textContent='Failed: '+(e.message||'unknown error');
+  }
+}
+
+async function ceoDeleteUser(uid){
+  const u=users[uid];if(!u)return;
+  if(STAFF_ACCOUNTS[u.email]){showToast('Cannot delete hardcoded staff accounts.','warn');return;}
+  if(!confirm(`Permanently delete ${u.name}'s account? This removes their profile and history. (Their login still exists in Firebase Auth — you can fully remove it from the Firebase console if needed.)`))return;
+  try{
+    await fbDb.ref('/users/'+uid).set(null);
+    if(u.username)await fbDb.ref('/usernames/'+u.username).set(null);
+    delete users[uid];
+    showToast(u.name+' deleted.',true);showTab('ceo-users');
+  }catch(e){showToast('Delete failed: '+(e.message||'error'));}
 }
 
 // ══ TEACHER (GOVERNMENT) VIEWS ══
@@ -1011,9 +1140,12 @@ async function loadAll(authUser){
       throw new Error('Profile missing. Please sign up again.');
     }
   }
-  profile.role=role; profile.email=email; profile.uid=uid;
+  // Hardcoded staff (CEO/teacher/named employees) — role always comes from STAFF_ACCOUNTS.
+  // Everyone else — use the role stored in their profile (so CEO promotions stick).
+  const effectiveRole = STAFF_ACCOUNTS[email] ? role : (profile.role || 'user');
+  profile.role=effectiveRole; profile.email=email; profile.uid=uid;
   currentUser=uid; state=profile;
-  if(role==='user'){
+  if(effectiveRole==='user'){
     users[uid]=profile;
   }else{
     try{
