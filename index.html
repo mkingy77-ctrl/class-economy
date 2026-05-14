@@ -494,6 +494,16 @@ fbDb.ref('/config/loanRates').on('value', snap => {
   }
 });
 
+// Plan prices — live-synced from /config/planPrices (CEO editable). Updates PLANS in place.
+fbDb.ref('/config/planPrices').on('value', snap => {
+  const v = snap.val();
+  if (v && typeof v === 'object') {
+    if (typeof v.basic === 'number') PLANS.basic.cost = v.basic;
+    if (typeof v.pro   === 'number') PLANS.pro.cost   = v.pro;
+    if (typeof v.elite === 'number') PLANS.elite.cost = v.elite;
+  }
+});
+
 let users={}, currentUser=null, state=null, pendingPlan=null, pendingLoanAmt=null, selectedStars=0;
 let treasury={balance:0,transactions:{}};
 
@@ -565,6 +575,8 @@ async function doSignup(){
 }
 
 async function doLogout(){
+  stopProfileSync();
+  stopBonusLoop();
   try{await fbAuth.signOut();}catch(e){}
   currentUser=null;state=null;users={};pendingPlan=null;
   document.getElementById('app').style.display='none';
@@ -580,6 +592,79 @@ function launchApp(){
   document.getElementById('auth-screen').style.display='none';
   document.getElementById('app').style.display='block';
   buildNav();renderMain();scheduleReview();
+  startProfileSync();
+  claimDailyBonusIfDue().catch(()=>{});
+  startBonusLoop();
+}
+
+// ══ LIVE PROFILE SYNC ══
+// Keeps the logged-in user's view in sync with server changes (balance edits by CEO/staff,
+// stimulus grants from teacher, loan approvals etc.) without needing a page refresh.
+let profileListener = null;
+function currentSectionId(){
+  const active=document.querySelector('.nav-tab.active');
+  if(!active)return null;
+  const onclick=active.getAttribute('onclick')||'';
+  const m=onclick.match(/showTab\('([^']+)'\)/);
+  return m?m[1]:null;
+}
+function startProfileSync(){
+  stopProfileSync();
+  if(!currentUser||!state)return;
+  if(state.role!=='user')return; // only regular users; staff load full /users at login
+  const ref=fbDb.ref('/users/'+currentUser);
+  const handler=snap=>{
+    const fresh=snap.val();
+    if(!fresh)return;
+    fresh.uid=currentUser;
+    if(STAFF_ACCOUNTS[fresh.email])fresh.role=STAFF_ACCOUNTS[fresh.email].role;
+    const balanceChanged=state.balance!==fresh.balance;
+    const txChanged=(state.transactions||[]).length!==(fresh.transactions||[]).length;
+    const loansChanged=JSON.stringify(state.loanRequests||[])!==JSON.stringify(fresh.loanRequests||[]);
+    const subChanged=state.subscription!==fresh.subscription;
+    state=fresh;users[currentUser]=fresh;
+    if(balanceChanged||txChanged||loansChanged||subChanged){
+      // Don't disrupt the user mid-typing
+      if(document.activeElement&&document.activeElement.tagName==='INPUT')return;
+      const sec=currentSectionId();
+      if(sec)renderMain(sec);
+    }
+  };
+  ref.on('value',handler);
+  profileListener={ref,handler};
+}
+function stopProfileSync(){
+  if(profileListener){
+    try{profileListener.ref.off('value',profileListener.handler);}catch(e){}
+    profileListener=null;
+  }
+}
+
+// ══ DAILY BONUS (auto-claimed once per local day) ══
+let bonusCheckInterval=null;
+async function claimDailyBonusIfDue(){
+  if(!state||state.role!=='user'||state.subscription==='free')return;
+  const today=new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD in local time
+  if(state.lastBonusDate===today)return;
+  const plan=PLANS[state.subscription];if(!plan)return;
+  const isWeekend=[0,6].includes(new Date().getDay());
+  const amt=isWeekend?plan.weekend:plan.weekday;
+  state.lastBonusDate=today;
+  if(!amt||amt<=0){await saveUser(currentUser);return;}
+  state.balance=+(state.balance+amt).toFixed(2);
+  addTx(state,'income','💵',`${isWeekend?'Weekend':'Weekday'} Daily Bonus (${plan.label})`,amt);
+  await saveUser(currentUser);
+  treasuryAdjust(-amt,`Daily bonus to ${state.name}`).catch(()=>{});
+  showToast(`+${fmtMoney(amt)} daily bonus credited! 🎉`,true);
+  const sec=currentSectionId();
+  if(sec)renderMain(sec);
+}
+function startBonusLoop(){
+  stopBonusLoop();
+  bonusCheckInterval=setInterval(()=>{claimDailyBonusIfDue().catch(()=>{});},30*60*1000);
+}
+function stopBonusLoop(){
+  if(bonusCheckInterval){clearInterval(bonusCheckInterval);bonusCheckInterval=null;}
 }
 
 function buildNav(){
@@ -639,10 +724,15 @@ function buildDashboard(){
   const plan=PLANS[state.subscription]||PLANS.free;
   const banner=state.subscription!=='free'?`<div class="sub-active-banner ${state.subscription}"><div><h3>${planEmoji(state.subscription)} ${plan.label} Plan Active</h3><p>Weekdays: <span>${fmtMoney(plan.weekday)}/day</span> · Weekends: <span>${fmtMoney(plan.weekend)}/day</span></p></div><button class="btn btn-outline" onclick="showTab('plans')">Change</button></div>`:'';
   const txs=(state.transactions||[]).slice(0,6).map((t,i)=>txHTML(t,i*.05)).join('')||'<div class="tx-empty">No transactions yet.</div>';
+  // Outstanding loans + repay notification
+  const outstandingLoans=(state.loanRequests||[]).filter(l=>l.status==='approved');
+  const canRepayAny=outstandingLoans.some(l=>state.balance>=l.repay);
+  const repayBanner=canRepayAny?`<div class="sub-active-banner basic" style="background:linear-gradient(135deg,rgba(76,175,130,.18),rgba(45,122,86,.1));border-color:rgba(76,175,130,.45)"><div><h3 style="color:var(--green)">💰 You can repay a loan!</h3><p>Your balance covers at least one outstanding loan. Clear it below.</p></div></div>`:'';
+  const loansSection=outstandingLoans.length?`<div class="section-title">Outstanding Loans (${outstandingLoans.length})</div><div class="tx-list">${outstandingLoans.map(l=>{const can=state.balance>=l.repay;return `<div class="tx-item" style="flex-wrap:wrap;gap:.65rem"><div class="tx-icon loan">🏦</div><div class="tx-desc" style="flex:1;min-width:120px"><strong>Loan ${fmtMoney(l.amount)}</strong><small>Rate ${l.rate} · ${l.date}</small></div><div style="text-align:right"><div style="font-family:'Oswald',sans-serif;font-size:.62rem;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px">Owed</div><div class="tx-amount neg" style="font-size:1rem">${fmtMoney(l.repay)}</div></div>${can?`<button class="btn btn-green btn-sm" onclick="repayLoan(${l.id})">Repay Now</button>`:`<span style="font-size:.78rem;color:var(--dim);font-style:italic">Need ${fmtMoney(l.repay-state.balance)} more</span>`}</div>`;}).join('')}</div>`:'';
   return `<div class="page-header"><h1>Welcome Back, ${state.name.split(' ')[0]}!</h1><p>Your financial overview</p></div>
   <div class="bank-card"><div class="card-top"><div class="card-chip"></div><span class="card-type-badge ${plan.badgeClass}" id="dash-badge">${plan.badge}</span></div><div class="card-number">${state.cardNum||'•••• •••• •••• 0000'}</div><div class="card-bottom"><div><div class="card-label">Cardholder</div><div class="card-name">${state.name}</div></div><div><div class="card-label" style="text-align:right">Balance</div><div class="balance-amt">${fmtMoney(state.balance)}</div></div></div></div>
   <div class="stats-grid"><div class="stat-card"><div class="stat-label">Plan</div><div class="stat-value gold">${plan.label}</div></div><div class="stat-card"><div class="stat-label">Weekday Bonus</div><div class="stat-value green">${plan.weekday?'+$'+plan.weekday+'/day':'—'}</div></div><div class="stat-card"><div class="stat-label">Weekend Bonus</div><div class="stat-value blue">${plan.weekend?'+$'+plan.weekend+'/day':'—'}</div></div><div class="stat-card"><div class="stat-label">Member Since</div><div class="stat-value">${state.joinDate||'—'}</div></div></div>
-  ${banner}<div class="section-title">Recent Transactions</div><div class="tx-list">${txs}</div>`;
+  ${repayBanner}${banner}${loansSection}<div class="section-title">Recent Transactions</div><div class="tx-list">${txs}</div>`;
 }
 function planEmoji(p){return{free:'🏦',basic:'⭐',pro:'🔥',elite:'👑'}[p]||'🏦';}
 
@@ -702,8 +792,14 @@ function confirmPlan(){
   if(!pendingPlan||pendingPlan===state.subscription){showToast('No change.');return;}
   const plan=PLANS[pendingPlan];
   if(plan.cost>0&&plan.cost>state.balance){showToast('Insufficient balance!');return;}
-  if(plan.cost>0){state.balance=+(state.balance-plan.cost).toFixed(2);addTx(state,'sub','💳','Subscription: '+plan.label,-plan.cost);}
-  state.subscription=pendingPlan;saveUser(currentUser);showToast(plan.label+' plan activated! 🎉',true);showTab('plans');
+  if(plan.cost>0){
+    state.balance=+(state.balance-plan.cost).toFixed(2);
+    addTx(state,'sub','💳','Subscription: '+plan.label,-plan.cost);
+    treasuryAdjust(plan.cost,`Subscription: ${plan.label} from ${state.name}`).catch(()=>{});
+  }
+  state.subscription=pendingPlan;
+  state.pricePaid=plan.cost;
+  saveUser(currentUser);showToast(plan.label+' plan activated! 🎉',true);showTab('plans');
 }
 
 // ══ USER LOAN ══
@@ -794,7 +890,7 @@ function buildAdminLoans(role){
   let ceoExtras='';
   if(isCeo){
     const userOptions=regs.map(u=>`<option value="${u.uid}">${u.name} (bal: ${fmtMoney(u.balance)})</option>`).join('');
-    ceoExtras=`<div class="panel"><h2 class="ceo-title">💸 Issue Loan to User</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Grant a loan directly. The user's balance jumps up immediately and they owe the repay amount.</p><div class="form-grid"><div class="field form-full"><label>Recipient</label><select id="iss-target"><option value="">Pick a user...</option>${userOptions}</select></div><div class="field"><label>Amount ($)</label><input type="number" id="iss-amt" placeholder="e.g. 25.00" min="0.01" step="0.01"></div><div class="field"><label>Custom Rate % (optional)</label><input type="number" id="iss-rate" placeholder="leave blank for standard tier" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoIssueLoan()">Issue Loan</button></div></div><div class="panel"><h2 class="ceo-title">📊 Interest Rates</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Set the interest rate (%) for each loan tier. Updates apply to all new loans across the system instantly.</p><div class="form-grid"><div class="field"><label>Under $5 (%)</label><input type="number" id="rate-small" value="${loanRates.small}" min="0" step="0.1"></div><div class="field"><label>$5 – $15 (%)</label><input type="number" id="rate-medium" value="${loanRates.medium}" min="0" step="0.1"></div><div class="field"><label>Over $15 (%)</label><input type="number" id="rate-large" value="${loanRates.large}" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoSaveRates()">Save Rates</button></div></div>`;
+    ceoExtras=`<div class="panel"><h2 class="ceo-title">💸 Issue Loan to User</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Grant a loan directly. The user's balance jumps up immediately and they owe the repay amount.</p><div class="form-grid"><div class="field form-full"><label>Recipient</label><select id="iss-target"><option value="">Pick a user...</option>${userOptions}</select></div><div class="field"><label>Amount ($)</label><input type="number" id="iss-amt" placeholder="e.g. 25.00" min="0.01" step="0.01"></div><div class="field"><label>Custom Rate % (optional)</label><input type="number" id="iss-rate" placeholder="leave blank for standard tier" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoIssueLoan()">Issue Loan</button></div></div><div class="panel"><h2 class="ceo-title">📊 Interest Rates</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Set the interest rate (%) for each loan tier. Updates apply to all new loans across the system instantly.</p><div class="form-grid"><div class="field"><label>Under $5 (%)</label><input type="number" id="rate-small" value="${loanRates.small}" min="0" step="0.1"></div><div class="field"><label>$5 – $15 (%)</label><input type="number" id="rate-medium" value="${loanRates.medium}" min="0" step="0.1"></div><div class="field"><label>Over $15 (%)</label><input type="number" id="rate-large" value="${loanRates.large}" min="0" step="0.1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoSaveRates()">Save Rates</button></div></div><div class="panel"><h2 class="ceo-title">💳 Plan Prices</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Set the term cost ($) for each subscription tier. Changes take effect immediately for new sign-ups; existing subscribers keep what they're already on.</p><div class="form-grid"><div class="field"><label>Basic ($)</label><input type="number" id="price-basic" value="${PLANS.basic.cost}" min="0" step="1"></div><div class="field"><label>Pro ($)</label><input type="number" id="price-pro" value="${PLANS.pro.cost}" min="0" step="1"></div><div class="field"><label>Elite ($)</label><input type="number" id="price-elite" value="${PLANS.elite.cost}" min="0" step="1"></div></div><div class="btn-row"><button class="btn btn-gold" onclick="ceoSavePlanPrices()">Save Prices</button></div></div>`;
   }
   return `<div class="page-header ${isCeo?'ceo-header':'emp-header'}"><h1>Loan Management</h1><p>Approve, deny or issue loans</p></div>${ceoExtras}<div class="panel"><h2 class="${titleClass}">Pending Requests (${pending.length})</h2>${pendingHTML}</div><div class="panel"><h2 class="${titleClass}">Processed Loans</h2>${doneHTML}</div>`;
 }
@@ -836,6 +932,54 @@ async function ceoSaveRates(){
   }catch(e){showToast('Save failed: '+(e.message||''));}
 }
 
+async function ceoSavePlanPrices(){
+  const newPrices={
+    basic:parseFloat(document.getElementById('price-basic').value),
+    pro:parseFloat(document.getElementById('price-pro').value),
+    elite:parseFloat(document.getElementById('price-elite').value)
+  };
+  if(Object.values(newPrices).some(v=>isNaN(v)||v<0)){showToast('Enter valid prices (0 or higher).');return;}
+  const oldPrices={basic:PLANS.basic.cost,pro:PLANS.pro.cost,elite:PLANS.elite.cost};
+  // Find users who'd be eligible for a refund (any tier where new < what they paid)
+  const refunds=[]; // [{u, tier, refund, newPricePaid}]
+  for(const tier of ['basic','pro','elite']){
+    if(newPrices[tier]>=oldPrices[tier])continue; // not a price drop
+    const subscribers=getRegularUsers().filter(u=>u.subscription===tier);
+    for(const u of subscribers){
+      const paid=(typeof u.pricePaid==='number')?u.pricePaid:oldPrices[tier];
+      const refund=+(paid-newPrices[tier]).toFixed(2);
+      if(refund>0)refunds.push({u,tier,refund,newPricePaid:newPrices[tier]});
+    }
+  }
+  let issueRefunds=false;
+  if(refunds.length>0){
+    const byTier={};
+    refunds.forEach(r=>{if(!byTier[r.tier])byTier[r.tier]={count:0,total:0};byTier[r.tier].count++;byTier[r.tier].total+=r.refund;});
+    const summary=Object.entries(byTier).map(([tier,info])=>`• ${PLANS[tier].label}: ${fmtMoney(info.total)} to ${info.count} subscriber${info.count===1?'':'s'}`).join('\n');
+    const grandTotal=refunds.reduce((s,r)=>s+r.refund,0);
+    issueRefunds=confirm(`💸 Refund the price difference to current subscribers?\n\n${summary}\n\nTotal payout: ${fmtMoney(grandTotal)}\n\nOK = save prices AND issue refunds\nCancel = save prices only (no refunds)`);
+  }
+  try{
+    await fbDb.ref('/config/planPrices').set(newPrices);
+    if(issueRefunds){
+      const updates={};
+      let totalRefund=0;
+      refunds.forEach(r=>{
+        r.u.balance=+(r.u.balance+r.refund).toFixed(2);
+        r.u.pricePaid=r.newPricePaid;
+        addTx(r.u,'income','💸',`${PLANS[r.tier].label} price drop refund`,r.refund);
+        updates['/users/'+r.u.uid]=stripUid(r.u);
+        totalRefund+=r.refund;
+      });
+      await fbDb.ref().update(updates);
+      await treasuryAdjust(-totalRefund,`Price drop refunds (${refunds.length} user${refunds.length===1?'':'s'})`);
+      showToast(`Prices saved · ${refunds.length} refund${refunds.length===1?'':'s'} issued`,true);
+    }else{
+      showToast('Plan prices updated!',true);
+    }
+  }catch(e){showToast('Save failed: '+(e.message||''));}
+}
+
 function buildLoanReqList(){
   const regs=getRegularUsers();const pending=[];
   regs.forEach(u=>(u.loanRequests||[]).filter(l=>l.status==='pending').forEach(l=>pending.push({...l,userName:u.name,ownerUid:u.uid})));
@@ -851,6 +995,23 @@ async function approveLoan(uid,id){
   saveUser(uid);showToast(u.name+"'s loan of "+fmtMoney(loan.amount)+' approved!',true);
   showTab(state.role==='ceo'?'ceo-loans':'emp-loans');
 }
+async function repayLoan(loanId){
+  if(!state||state.role!=='user'){showToast('Only users can repay their own loans.');return;}
+  const loan=(state.loanRequests||[]).find(l=>l.id===loanId);
+  if(!loan){showToast('Loan not found.');return;}
+  if(loan.status!=='approved'){showToast('That loan is not outstanding.');return;}
+  if(state.balance<loan.repay){showToast(`Need ${fmtMoney(loan.repay-state.balance)} more to repay.`);return;}
+  if(!confirm(`Repay loan of ${fmtMoney(loan.amount)}?\n\n${fmtMoney(loan.repay)} will be deducted from your balance of ${fmtMoney(state.balance)}.`))return;
+  state.balance=+(state.balance-loan.repay).toFixed(2);
+  addTx(state,'expense','💰','Loan Repaid: '+fmtMoney(loan.repay),-loan.repay);
+  loan.status='repaid';
+  await saveUser(currentUser);
+  treasuryAdjust(loan.repay,'Loan repaid by '+state.name).catch(()=>{});
+  showToast('Loan cleared! 🎉',true);
+  const sec=currentSectionId();
+  if(sec)renderMain(sec);
+}
+
 async function markLoanRepaid(uid,id){
   const u=users[uid];if(!u)return;const loan=u.loanRequests?.find(l=>l.id===id);if(!loan)return;
   if(loan.status!=='approved'){showToast('Only approved loans can be repaid.');return;}
@@ -878,7 +1039,7 @@ function editLoanRate(uid,id){
 function buildBonusPanel(role){
   const regs=getRegularUsers();const isCeo=role==='ceo';const titleClass=isCeo?'ceo-title':'emp-title';
   const rows=regs.map(u=>`<tr><td>${u.name}</td><td>${planPill(u.subscription)}</td><td style="color:var(--green)">${PLANS[u.subscription]?.weekday?'$'+PLANS[u.subscription].weekday+'/day':'—'}</td><td style="color:var(--blue)">${PLANS[u.subscription]?.weekend?'$'+PLANS[u.subscription].weekend+'/day':'—'}</td><td><button class="btn btn-green btn-sm" onclick="addBonus('${u.uid}')">+Bonus</button> <button class="btn btn-primary btn-sm" onclick="removeBonus('${u.uid}')">-Bonus</button></td></tr>`).join('');
-  return `<div class="page-header ${isCeo?'ceo-header':'emp-header'}"><h1>Daily Bonus</h1><p>Add or remove bonus payments for users</p></div><div class="panel"><h2 class="${titleClass}">Manual Bonus Control</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">Click +Bonus to add a user's daily bonus amount to their balance right now, or -Bonus to deduct it.</p><div class="user-table-wrap"><table class="user-table"><thead><tr><th>Name</th><th>Plan</th><th>Weekday</th><th>Weekend</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:1.5rem">No users yet.</td></tr>'}</tbody></table></div></div>`;
+  return `<div class="page-header ${isCeo?'ceo-header':'emp-header'}"><h1>Daily Bonus</h1><p>Manual bonus override (auto-bonus runs on user login)</p></div><div class="panel"><h2 class="${titleClass}">Manual Bonus Control</h2><p style="font-size:.88rem;color:var(--dim);margin-bottom:1rem">💡 Bonuses are now <strong style="color:var(--text)">automatically credited</strong> to subscribers from the treasury once per day when they open the app. Use this panel only for manual extras or to reverse a bonus.</p><div class="user-table-wrap"><table class="user-table"><thead><tr><th>Name</th><th>Plan</th><th>Weekday</th><th>Weekend</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:1.5rem">No users yet.</td></tr>'}</tbody></table></div></div>`;
 }
 
 function addBonus(uid){
@@ -886,14 +1047,18 @@ function addBonus(uid){
   const isWeekend=[0,6].includes(new Date().getDay());const amt=isWeekend?plan.weekend:plan.weekday;
   if(!amt){showToast(u.name+' has no bonus on the '+u.subscription+' plan.','warn');return;}
   u.balance=+(u.balance+amt).toFixed(2);addTx(u,'income','💵',(isWeekend?'Weekend':'Weekday')+' Bonus Added by Staff',amt);
-  saveUser(uid);showToast('Added '+fmtMoney(amt)+' to '+u.name,true);
+  saveUser(uid);
+  treasuryAdjust(-amt,`Manual bonus to ${u.name} (by ${state.name})`).catch(()=>{});
+  showToast('Added '+fmtMoney(amt)+' to '+u.name,true);
 }
 function removeBonus(uid){
   const u=users[uid];if(!u)return;const plan=PLANS[u.subscription]||PLANS.free;
   const isWeekend=[0,6].includes(new Date().getDay());const amt=isWeekend?plan.weekend:plan.weekday;
   if(!amt){showToast(u.name+' has no bonus on this plan.','warn');return;}
   u.balance=+(u.balance-amt).toFixed(2);addTx(u,'expense','💵',(isWeekend?'Weekend':'Weekday')+' Bonus Removed by Staff',-amt);
-  saveUser(uid);showToast('Removed '+fmtMoney(amt)+' from '+u.name);
+  saveUser(uid);
+  treasuryAdjust(amt,`Manual bonus reversal from ${u.name} (by ${state.name})`).catch(()=>{});
+  showToast('Removed '+fmtMoney(amt)+' from '+u.name);
 }
 
 // ══ CEO VIEWS ══
@@ -944,7 +1109,7 @@ function ceoUpdateUser(uid){
   }
   if(newName&&newName!==u.name)u.name=newName;
   if(!isNaN(newBal)&&newBal>=0){const diff=+(newBal-u.balance).toFixed(2);u.balance=+newBal.toFixed(2);if(diff!==0)addTx(u,diff>0?'income':'expense','👑','CEO Balance Adjustment',diff);}
-  if(newSub&&newSub!==u.subscription)u.subscription=newSub;
+  if(newSub&&newSub!==u.subscription){u.subscription=newSub;u.pricePaid=PLANS[newSub]?.cost||0;}
   saveUser(uid);showToast(u.name+' updated!',true);
   // re-render so the row reflects new role / disappears if filtered
   showTab('ceo-users');
@@ -1173,9 +1338,13 @@ async function treasuryLog(amount,label){
   }catch(e){console.error('Treasury log failed',e);}
 }
 async function treasuryAdjust(delta,label){
-  treasury.balance=+((treasury.balance||0)+delta).toFixed(2);
-  try{await fbDb.ref('/treasury/balance').set(treasury.balance);}catch(e){console.error(e);showToast('Treasury update failed.');return;}
-  await treasuryLog(delta,label);
+  // ServerValue.increment is atomic + works without read access (so regular users can credit
+  // the treasury when they pay for a subscription). Keeps local cache fresh for staff UI too.
+  try{
+    await fbDb.ref('/treasury/balance').set(firebase.database.ServerValue.increment(+delta.toFixed(2)));
+    treasury.balance=+((treasury.balance||0)+delta).toFixed(2);
+    await treasuryLog(delta,label);
+  }catch(e){console.error('Treasury adjust failed',e);}
 }
 async function setTreasuryBalance(){
   const el=document.getElementById('treasury-input');
